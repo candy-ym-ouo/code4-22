@@ -4,26 +4,18 @@ on:
   push:
   pull_request:
 
-jobs:
-  verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.15.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm test
-      - run: pnpm build
-      - run: pnpm audit --prod --audit-level high
+# 同一引用的新推送自动取消旧运行，避免失效的门禁占用发布队列
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
-  integration:
+jobs:
+  # 单一发布门禁：所有环节严格串行，任一环节失败立即中断，后续（含发布）一律不执行。
+  # 环节顺序：依赖安装 -> 数据库迁移 -> 类型检查 -> 测试 -> 生产构建 -> 安全审计 -> 冒烟验收 -> 发布
+  release-gate:
+    name: Release gate (install → migrate → types → tests → build)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
@@ -47,28 +39,85 @@ jobs:
       APP_PORT: 3000
       LOG_LEVEL: silent
       SMOKE_PASSWORD: smoke-test-password-123
+      CI: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
         with:
           version: 10.15.0
-      - uses: actions/setup-node@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 22
+          # 依赖缓存以 pnpm-lock.yaml 为键：锁文件不变才命中，锁文件一变即失效重装
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @handcraft/contracts build
-      - run: pnpm --filter @handcraft/api build
-      - run: pnpm --filter @handcraft/api db:migrate
-      - run: |
+          cache-dependency-path: pnpm-lock.yaml
+
+      # 环节 1：严格按锁文件安装，锁文件与 package.json 不一致直接失败
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # 环节 2：在全新数据库上执行迁移，验证 SQL 与迁移器可用；失败则门禁终止
+      - name: Run database migrations
+        run: pnpm db:migrate
+
+      # 环节 3：类型检查（含 contracts 构建，供 web/api 类型解析）
+      - name: Type check
+        run: pnpm typecheck
+
+      # 环节 4：单元测试
+      - name: Run unit tests
+        run: pnpm test
+
+      # 环节 5：生产构建；web 构建内含 vue-tsc 类型门禁
+      - name: Build production artifacts
+        run: pnpm build
+
+      # 环节 6：生产依赖安全审计，high 及以上漏洞即阻断
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level high
+        continue-on-error: false
+
+      # 环节 7：启动生产构建产物，对真实服务跑端到端冒烟验收
+      - name: Smoke test production server
+        run: |
           node apps/api/dist/server.js &
           API_PID=$!
           trap 'kill $API_PID 2>/dev/null || true' EXIT
+          ready=0
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:3000/health/ready >/dev/null; then
+              ready=1
               break
             fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:3000/health/ready >/dev/null
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::API did not become ready within 30s"
+            exit 1
+          fi
           SMOKE_BASE_URL=http://127.0.0.1:3000 node ops/smoke-test.mjs
+
+  # 发布环节：仅在整条门禁（含冒烟验收）通过后才创建 Release；
+  # needs 为隐式硬依赖，release-gate 失败时 GitHub 会直接跳过本环节。
+  release:
+    name: Publish GitHub release
+    needs: release-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 只发布规范版本标签（v1.2.3），分支推送与 PR 不会触发发布
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${GITHUB_REF_NAME}" --notes "Release ${GITHUB_REF_NAME} passed the full CI release gate (install, migration, types, tests, build, audit, smoke)." --title "${GITHUB_REF_NAME}"

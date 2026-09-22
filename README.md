@@ -90,6 +90,20 @@ node ops/smoke-test.mjs
 
 建议只在专用验收数据库执行该脚本，因为它会留下测试业务数据。
 
+## 持续集成与发布门禁
+
+`.github/workflows/ci.yml` 在每次 push 和 pull request 时运行单条严格串行的发布门禁（单个 job，任一环节失败立即中断）：
+
+1. `pnpm install --frozen-lockfile` 按锁文件安装，依赖缓存以 `pnpm-lock.yaml` 的哈希为键，锁文件变更即缓存失效。
+2. 在全新 PostgreSQL 16 上执行 `pnpm db:migrate`。
+3. `pnpm typecheck` 全仓类型检查。
+4. `pnpm test` 全部单元测试。
+5. `pnpm build` 生产构建。
+6. `pnpm audit --prod --audit-level high` 生产依赖安全审计。
+7. 启动构建产物并运行 `ops/smoke-test.mjs` 端到端冒烟验收。
+
+仅当以上全部通过，`v` 开头的版本标签（如 `v1.2.3`）才会创建 GitHub Release；门禁失败时发布环节自动跳过。
+
 ## 业务一致性
 
 - 批次是库存的最小核算单位，材料列表只做聚合。
