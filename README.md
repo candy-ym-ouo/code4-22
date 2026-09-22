@@ -78,6 +78,20 @@ pnpm test
 pnpm build
 ```
 
+## 持续集成与发布门禁
+
+`.github/workflows/quality-gate.yml` 在每次推送到 `main` 和每个 Pull Request 上运行，并以可复用工作流的身份被发布流水线调用。门禁在同一 Job 内严格串行执行五个阶段，任一阶段失败都会立即终止，后续阶段不会执行：
+
+1. **依赖安装** — `pnpm install --frozen-lockfile`，锁文件与 `package.json` 不一致即失败，且不会在 CI 中改写锁文件。
+2. **数据库迁移** — 对一次性的 PostgreSQL 16 服务执行 `pnpm db:migrate`（镜像已含 `pgcrypto`、`pg_trgm`、`citext`），迁移脚本会对已应用文件做 checksum 校验。
+3. **类型检查** — `pnpm typecheck`（先构建 `contracts`，再递归检查全部子包）。
+4. **测试** — `pnpm test`。
+5. **生产构建** — `pnpm build`，只有前四步全部通过才会运行。
+
+pnpm store 缓存严格按 `pnpm-lock.yaml` 的哈希隔离：缓存 key 只包含锁文件哈希且**不配置 `restore-keys` 回退**，锁文件任何改动都会导致冷缓存，杜绝旧依赖被错误复用。
+
+发布由 `.github/workflows/release.yml` 控制：推送 `v*` 标签（或手动指定已有标签）时，先调用质量门禁工作流，发布 Job 通过 `needs: quality-gate` 绑定其结果；依赖安装、迁移、类型、测试或构建任一失败，GitHub Release 都不会创建。建议在仓库设置中将 `Quality Gate (install · migrate · typecheck · test · build)` 设为 `main` 与标签的必需状态检查，并对 `release` 环境启用必要审批人。
+
 对已初始化的运行环境执行完整 API 验收链：
 
 ```bash

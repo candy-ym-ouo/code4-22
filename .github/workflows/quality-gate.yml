@@ -1,0 +1,95 @@
+name: Quality Gate
+
+# 全栈发布门禁：依赖安装 -> 数据库迁移 -> 类型检查 -> 测试 -> 构建
+# 五个阶段为同一 Job 内串行的独立 step，默认 if: success()，
+# 任一 step 失败都会立即中断，后续阶段不会执行。
+# 同时供 release.yml 以 reusable workflow 方式调用。
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gate:
+    name: Install → Migrate → Typecheck → Test → Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: handcraft
+          POSTGRES_PASSWORD: change-me
+          POSTGRES_DB: handcraft
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U handcraft -d handcraft"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # 仅供 CI 一次性数据库使用，密码为 development 占位值
+      # （apps/api/src/config.ts 只禁止生产环境使用该占位值）
+      DATABASE_URL: postgresql://handcraft:change-me@localhost:5432/handcraft
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+          # 版本取自根 package.json 的 packageManager 字段（pnpm@10.15.0）
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      # 缓存严格按锁文件隔离：key 仅含 pnpm-lock.yaml 的哈希，
+      # 故意不配置 restore-keys，锁文件任何变动都会导致缓存未命中，
+      # 杜绝旧锁文件依赖被错误复用。
+      - name: Restore pnpm store (keyed by lockfile hash)
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.dir }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+      # 门禁 1/5：依赖安装。--frozen-lockfile 保证 lockfile 与
+      # package.json 不一致时直接失败，且不会在 CI 中改写锁文件。
+      - name: Gate 1/5 · Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 门禁 2/5：数据库迁移。PostgreSQL 16 服务通过健康检查后才会到达此步。
+      - name: Gate 2/5 · Run database migrations
+        run: pnpm db:migrate
+
+      # 门禁 3/5：类型检查（contracts 先构建，再对所有子包递归检查）
+      - name: Gate 3/5 · Typecheck
+        run: pnpm typecheck
+
+      # 门禁 4/5：测试
+      - name: Gate 4/5 · Test
+        run: pnpm test
+
+      # 门禁 5/5：生产构建（最后执行，只有前四步全部通过才会运行）
+      - name: Gate 5/5 · Build
+        run: pnpm build
